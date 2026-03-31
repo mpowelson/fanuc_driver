@@ -5,6 +5,7 @@
 
 #include "fanuc_robot_driver/hardware_interface.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -27,6 +28,31 @@ using StatusGPIOTypes = ::fanuc_client::GPIOBuffer::StatusGPIOTypes;
 
 constexpr auto kFRHWInterface = "FR_HW_Interface";
 constexpr int kNumberConnectionAttempts = 5;
+constexpr double kMillimetersPerMeter = 1000.0;
+constexpr auto kStationAxisJointName = "station_axis_joint";
+
+bool IsLinearExternalJoint(const hardware_interface::ComponentInfo& joint)
+{
+  return joint.name == kStationAxisJointName;
+}
+
+double FanucPositionToRos(const hardware_interface::ComponentInfo& joint, double value)
+{
+  if (IsLinearExternalJoint(joint))
+  {
+    return value / kMillimetersPerMeter;
+  }
+  return M_PI / 180.0 * value;
+}
+
+double RosPositionToFanuc(const hardware_interface::ComponentInfo& joint, double value)
+{
+  if (IsLinearExternalJoint(joint))
+  {
+    return value * kMillimetersPerMeter;
+  }
+  return 180.0 / M_PI * value;
+}
 
 int StringToInt(const std::string& param_name, const std::string& param_value)
 {
@@ -388,7 +414,10 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_activate(const rcl
 
   fanuc_client_->startRealtimeStream(gpio_buffer_);
   joint_targets_degrees_ = fanuc_client_->readJointAngles();
-  joint_targets_.array() = M_PI / 180.0 * joint_targets_degrees_.array();
+  for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
+  {
+    joint_targets_[i] = FanucPositionToRos(info_.joints[i], joint_targets_degrees_[i]);
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -505,9 +534,11 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
   {
     fr_prev_joint_pos_ = fr_joint_pos_;
     const Eigen::Ref<const Eigen::VectorXd> joint_angles = fanuc_client_->readJointAngles();
-    for (Eigen::Index i = 0; i < joint_angles.size(); ++i)
+    const Eigen::Index joint_count =
+        std::min(static_cast<Eigen::Index>(info_.joints.size()), joint_angles.size());
+    for (Eigen::Index i = 0; i < joint_count; ++i)
     {
-      fr_joint_pos_[i] = M_PI / 180.0 * joint_angles[i];
+      fr_joint_pos_[i] = FanucPositionToRos(info_.joints[i], joint_angles[i]);
     }
     if ((fr_prev_joint_pos_.array() != fr_joint_pos_.array()).any())
     {
@@ -583,7 +614,10 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
 
   try
   {
-    joint_targets_degrees_.array() = 180.0 / M_PI * joint_targets_.array();
+    for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
+    {
+      joint_targets_degrees_[i] = RosPositionToFanuc(info_.joints[i], joint_targets_[i]);
+    }
     fanuc_client_->writeJointTarget(joint_targets_degrees_);
 
     for (const auto& io_command : io_commands_)
