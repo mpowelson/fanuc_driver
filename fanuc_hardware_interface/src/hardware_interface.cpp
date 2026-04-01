@@ -5,11 +5,15 @@
 
 #include "fanuc_robot_driver/hardware_interface.hpp"
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "fanuc_client/gpio_buffer.hpp"
@@ -29,11 +33,73 @@ using StatusGPIOTypes = ::fanuc_client::GPIOBuffer::StatusGPIOTypes;
 constexpr auto kFRHWInterface = "FR_HW_Interface";
 constexpr int kNumberConnectionAttempts = 5;
 constexpr double kMillimetersPerMeter = 1000.0;
+constexpr Eigen::Index kFanucAxisCount = 9;
 constexpr auto kStationAxisJointName = "station_axis_joint";
 
 bool IsLinearExternalJoint(const hardware_interface::ComponentInfo& joint)
 {
   return joint.name == kStationAxisJointName;
+}
+
+bool HasPositionCommandInterface(const hardware_interface::ComponentInfo& joint)
+{
+  return std::any_of(joint.command_interfaces.begin(), joint.command_interfaces.end(),
+                     [](const auto& interface) { return interface.name == hardware_interface::HW_IF_POSITION; });
+}
+
+std::optional<Eigen::Index> TryGetFanucAxisIndex(const std::string& joint_name)
+{
+  if (joint_name == kStationAxisJointName)
+  {
+    return 6;
+  }
+
+  static constexpr std::array<std::string_view, 9> kJointNames = { "J1", "J2", "J3", "J4", "J5", "J6", "J7", "J8",
+                                                                    "J9" };
+  for (Eigen::Index index = 0; index < static_cast<Eigen::Index>(kJointNames.size()); ++index)
+  {
+    if (joint_name == kJointNames[static_cast<size_t>(index)])
+    {
+      return index;
+    }
+  }
+
+  return std::nullopt;
+}
+
+Eigen::Index GetFanucAxisIndex(const hardware_interface::ComponentInfo& joint)
+{
+  const std::optional<Eigen::Index> axis_index = TryGetFanucAxisIndex(joint.name);
+  if (!axis_index.has_value())
+  {
+    throw std::invalid_argument("Unsupported FANUC joint name: " + joint.name);
+  }
+  return *axis_index;
+}
+
+std::string DescribeJointMapping(const std::vector<hardware_interface::ComponentInfo>& joints)
+{
+  std::ostringstream mapping;
+  bool first = true;
+  for (const auto& joint : joints)
+  {
+    const std::optional<Eigen::Index> axis_index = TryGetFanucAxisIndex(joint.name);
+    if (!first)
+    {
+      mapping << ", ";
+    }
+    first = false;
+    mapping << joint.name << "->";
+    if (axis_index.has_value())
+    {
+      mapping << "axis" << (*axis_index + 1);
+    }
+    else
+    {
+      mapping << "unmapped";
+    }
+  }
+  return mapping.str();
 }
 
 double FanucPositionToRos(const hardware_interface::ComponentInfo& joint, double value)
@@ -316,6 +382,7 @@ FanucHardwareInterface::FanucHardwareInterface()
   , fr_joint_vel_{ Eigen::VectorXd::Zero(9) }
   , joint_targets_{ Eigen::VectorXd::Zero(9) }
   , joint_targets_degrees_{ Eigen::VectorXd::Zero(9) }
+  , latest_joint_positions_fanuc_{ Eigen::VectorXd::Zero(9) }
   , stream_motion_port_(60015)
   , rmi_port_(1600)
 {
@@ -330,6 +397,19 @@ hardware_interface::CallbackReturn FanucHardwareInterface::on_init(const hardwar
     return CallbackReturn::ERROR;
   }
   info_ = info;
+
+  try
+  {
+    for (const auto& joint : info_.joints)
+    {
+      (void)GetFanucAxisIndex(joint);
+    }
+  }
+  catch (const std::exception& e)
+  {
+    RCLCPP_ERROR(rclcpp::get_logger(kFRHWInterface), "Invalid joint mapping: %s", e.what());
+    return CallbackReturn::ERROR;
+  }
 
   // Parse and configure cyclic GPIO from the yaml config.
   const auto config_path_it = info_.hardware_parameters.find("gpio_configuration");
@@ -411,12 +491,16 @@ FanucHardwareInterface::on_configure(const rclcpp_lifecycle::State& /*previous_s
 hardware_interface::CallbackReturn FanucHardwareInterface::on_activate(const rclcpp_lifecycle::State& previous_state)
 {
   RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface), "activating hardware interface");
+  RCLCPP_INFO_STREAM(rclcpp::get_logger(kFRHWInterface),
+                     "Configured joint to FANUC axis mapping: " << DescribeJointMapping(info_.joints));
 
   fanuc_client_->startRealtimeStream(gpio_buffer_);
-  joint_targets_degrees_ = fanuc_client_->readJointAngles();
+  latest_joint_positions_fanuc_ = fanuc_client_->readJointAngles();
+  joint_targets_degrees_ = latest_joint_positions_fanuc_;
   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
   {
-    joint_targets_[i] = FanucPositionToRos(info_.joints[i], joint_targets_degrees_[i]);
+    const Eigen::Index axis_index = GetFanucAxisIndex(info_.joints[static_cast<size_t>(i)]);
+    joint_targets_[i] = FanucPositionToRos(info_.joints[static_cast<size_t>(i)], joint_targets_degrees_[axis_index]);
   }
 
   return CallbackReturn::SUCCESS;
@@ -485,7 +569,11 @@ std::vector<hardware_interface::CommandInterface> FanucHardwareInterface::export
   command_interfaces.reserve(info_.joints.size());
   for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
   {
-    command_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &joint_targets_[i]);
+    if (HasPositionCommandInterface(info_.joints[static_cast<size_t>(i)]))
+    {
+      command_interfaces.emplace_back(info_.joints[static_cast<size_t>(i)].name, hardware_interface::HW_IF_POSITION,
+                                      &joint_targets_[i]);
+    }
   }
 
   for (const auto& io_command : io_commands_)
@@ -534,11 +622,15 @@ hardware_interface::return_type FanucHardwareInterface::read(const rclcpp::Time&
   {
     fr_prev_joint_pos_ = fr_joint_pos_;
     const Eigen::Ref<const Eigen::VectorXd> joint_angles = fanuc_client_->readJointAngles();
-    const Eigen::Index joint_count =
-        std::min(static_cast<Eigen::Index>(info_.joints.size()), joint_angles.size());
-    for (Eigen::Index i = 0; i < joint_count; ++i)
+    latest_joint_positions_fanuc_ = joint_angles;
+    for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
     {
-      fr_joint_pos_[i] = FanucPositionToRos(info_.joints[i], joint_angles[i]);
+      const Eigen::Index axis_index = GetFanucAxisIndex(info_.joints[static_cast<size_t>(i)]);
+      if (axis_index >= joint_angles.size())
+      {
+        throw std::out_of_range("FANUC joint state vector is missing axis index " + std::to_string(axis_index + 1));
+      }
+      fr_joint_pos_[i] = FanucPositionToRos(info_.joints[static_cast<size_t>(i)], joint_angles[axis_index]);
     }
     if ((fr_prev_joint_pos_.array() != fr_joint_pos_.array()).any())
     {
@@ -614,10 +706,17 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
 
   try
   {
+    joint_targets_degrees_ = latest_joint_positions_fanuc_;
     for (Eigen::Index i = 0; i < static_cast<Eigen::Index>(info_.joints.size()); ++i)
     {
-      joint_targets_degrees_[i] = RosPositionToFanuc(info_.joints[i], joint_targets_[i]);
+      if (HasPositionCommandInterface(info_.joints[static_cast<size_t>(i)]))
+      {
+        const Eigen::Index axis_index = GetFanucAxisIndex(info_.joints[static_cast<size_t>(i)]);
+        joint_targets_degrees_[axis_index] =
+            RosPositionToFanuc(info_.joints[static_cast<size_t>(i)], joint_targets_[i]);
+      }
     }
+
     fanuc_client_->writeJointTarget(joint_targets_degrees_);
 
     for (const auto& io_command : io_commands_)
@@ -628,14 +727,12 @@ hardware_interface::return_type FanucHardwareInterface::write(const rclcpp::Time
   }
   catch (const std::exception& e)
   {
-    // During shutdown, operations may fail - log but don't crash
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Exception during write (likely shutdown): %s", e.what());
+    RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Write failed: %s", e.what());
     return hardware_interface::return_type::ERROR;
   }
   catch (...)
   {
-    // Catch any other exceptions during shutdown
-    RCLCPP_DEBUG(rclcpp::get_logger(kFRHWInterface), "Unknown exception during write (likely shutdown)");
+    RCLCPP_WARN(rclcpp::get_logger(kFRHWInterface), "Unknown exception during write");
     return hardware_interface::return_type::ERROR;
   }
 

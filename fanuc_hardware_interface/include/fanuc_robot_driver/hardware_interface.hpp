@@ -91,6 +91,7 @@ private:
   Eigen::VectorXd fr_joint_vel_;
   Eigen::VectorXd joint_targets_;
   Eigen::VectorXd joint_targets_degrees_;
+  Eigen::VectorXd latest_joint_positions_fanuc_;
   RobotStatusValues robot_status_;
   ForceSensorValues force_sensor_;
   std::string ip_address_;
